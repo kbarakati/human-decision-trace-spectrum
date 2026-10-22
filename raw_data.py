@@ -108,3 +108,22 @@ def schedule(data, n_candidates=20, n_steps=100, seed=42, patch_size=16):
         'dataset': data['dataset'], 'axis_label': data['axis_label'],
         'response_label': data['response_label'],
     }
+
+
+def get_full_response(data, idx):
+    """Return the measured response and full original measurement at a location."""
+    idx = int(idx)
+    nx, ny = data["grid_shape"]
+    i, j = divmod(idx, ny)
+    if data["dataset"] == "eels":
+        axis = np.asarray(data["energy"]).copy()
+        signal = np.asarray(data["cube"][i, j]).copy()
+        raw = signal.copy()
+        channels = ["EELS intensity"]
+    else:
+        with h5py.File(data["h5_path"], "r") as f:
+            raw = np.asarray(f[f"ForceMap/0/{i}:{j}"][:]).copy()
+        axis = raw[7].copy()
+        signal = raw[2].copy()
+        channels = [f"ForceMap channel {k}" for k in range(raw.shape[0])]
+    return {"axis": axis, "signal": signal, "raw": raw, "channels": channels}

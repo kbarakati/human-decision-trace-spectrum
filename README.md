@@ -1,20 +1,49 @@
-# Human decision trace — participant uploads
+# Human Scientific Measurement Selection — full Pickle traces
 
-This app accepts the original EELS `.npy` file, or AFM `.ibw` and `.h5` files, directly from each participant's browser. Participants enter a code, upload authorized raw files, choose among 20 microscopy patches, see the selected response, and review their history. The app does not require `manual_dataset.pkl.gz`, `export_data.py`, or raw data checked into Git.
+A Streamlit app for a manual decision study. Each participant uploads authorized EELS `.npy` or AFM `.ibw` + `.h5` files, sees 20 image patches per decision, selects one, sees its measured response, and can review the accumulated image–measurement history.
 
-## Deploy
+## Install and run
 
-1. Push `app.py`, `raw_data.py`, `requirements.txt`, `.streamlit/config.toml`, and `.gitignore` to the GitHub repository.
-2. In Streamlit Community Cloud, **Manage app > Settings > Secrets**, create a `[participant_codes]` table based on `.streamlit/secrets.toml.example` and replace every sample code with a real random passcode. Save the organizer-only code-to-name map outside GitHub.
-3. Deploy `app.py`. Participants open the HTTPS link, enter their codes and upload the files.
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
 
-## Critical hosting and experimental limitations
+For Streamlit Community Cloud, deploy `app.py` from the GitHub repository and set the `[participant_codes]` section using the Streamlit Cloud app **Secrets** editor. Do not commit `.streamlit/secrets.toml` or raw scientific files.
 
-- Streamlit Community Cloud may not support very large file uploads or enough memory/disk for these files. The AFM HDF5 file is about **1.27 GB** and the EELS `.npy` around **557 MB**. The upload limit is raised to 1600 MB in `.streamlit/config.toml`, but this does **not** guarantee the hosting service will accept/process them. If uploads or app memory fail, use a more capable host or smaller approved, scientifically valid data partitions.
-- Each participant receives *all* responses by uploading the complete source data. The UI hides unrevealed spectra, but the study is **not blind**. Participants must have permission to access these files.
-- The SQLite decision database is stored on the **ephemeral local Streamlit server disk**, which can be lost on restart. The app provides downloadable coded `json.gz` traces after each decision. For robust group research, connect a persistent database before collecting official traces.
-- Candidate schedules are identical for participants who upload the same files: 20 per step, 100 steps, seed 42. The AFM image-to-force-map mapping uses the same grid convention as the SV-DKL notebook, but physical alignment is not independently verified.
-- Dataset session keys reflect type and EELS dataset ID, not cryptographic file identity. The organizer must ensure participants upload the exact same files. The app does not provide verified data provenance.
-- Shared trace files include coded IDs and selected measurements; organizer name mapping must be kept separately. Timestamps can potentially reidentify participants; remove before publication if needed.
+Example private secrets (use randomly generated codes, not these placeholders):
 
-Local launch: `python -m pip install -r requirements.txt && python -m streamlit run app.py`.
+```toml
+[participant_codes]
+P01 = "REPLACE_WITH_RANDOM_ACCESS_CODE_1"
+P02 = "REPLACE_WITH_RANDOM_ACCESS_CODE_2"
+```
+
+Preserve the mapping from `P01`–`P06` to real operator identities only in your organizer records, not in shared traces. Participant codes should be distributed privately.
+
+## File uploads
+
+- **AFM:** Original IBW image and HDF5 force map. The image uses `Channel_001` transposed; a measurement at `i:j` is `ForceMap/0/i:j`. The display shows channel 2 against channel 7. The Pickle trace additionally saves the entire original 8-channel (or available-channel) force curve for every selected measurement.
+- **EELS:** Original `.npy` dictionary collection; select dataset ID. The display and trace use the corresponding spectral-image voxel and energy axis.
+
+The same fixed candidate seed is used across participants; different raw upload content is fingerprinted to avoid mixing histories inadvertently. All options presented per completed decision are retained in the output `.pkl`.
+
+## Main downloadable output
+
+`trace_P0x_<dataset-key>.pkl`: Python dictionary with participant pseudonym, dataset ID/fingerprint, microscopy grid shape, 20 image patches per completed step, all candidate indices/IDs/coordinates, selected position, selected response and axis, full selected AFM force curves or EELS spectra, selection timestamps, and reproducible scheduling metadata. Selected-position indexing is 0-based; step number is 1-based.
+
+Read locally:
+
+```python
+import pickle
+with open('trace_P01_....pkl', 'rb') as f:
+    trace = pickle.load(f)
+print(trace.keys())
+print(trace['decisions'][0].keys())
+```
+
+**Security:** Only load Pickle files from trusted sources. A Pickle file can execute code when unpickled. Uploaded original raw data contain all scientific responses, so this is not a blinded-data study.
+
+**Persistence caveat:** The app's SQLite database is stored on the app's local filesystem. Streamlit Community Cloud may reset this filesystem; participants should download their trace after every session. For durable central recordkeeping across server restarts, connect an external persistent database before running a formal group study. The download is generated from the current dataset upload plus recorded selections.
+
+**Large-upload caveat:** `.streamlit/config.toml` sets a 1600 MB upload limit, but Streamlit Cloud's RAM and storage resources may be too limited for a 1.3 GB HDF5 or 557 MB NPY upload. These limits are independent of the file-upload size setting.

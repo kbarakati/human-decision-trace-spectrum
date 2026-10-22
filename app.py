@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import pickle
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from PIL import Image
-from raw_data import load_eels, load_nonlinearity, schedule, get_response
+from raw_data import load_eels, load_nonlinearity, schedule, get_response, get_full_response
 
 st.set_page_config(page_title="Human Image–Spectrum Decisions", layout="wide")
 BASE = Path(__file__).resolve().parent
@@ -103,7 +104,8 @@ def plot_spectrum(raw, idx):
 
 
 def save_upload(upload, dest):
-    """Stream upload to a temporary file instead of calling getvalue()."""
+    """Write uploaded file in chunks and compute a stable dataset fingerprint."""
+    digest = hashlib.sha256()
     upload.seek(0)
     with open(dest, "wb") as out:
         while True:
@@ -111,6 +113,8 @@ def save_upload(upload, dest):
             if not chunk:
                 break
             out.write(chunk)
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def create_dataset(mode, files, eels_id):
@@ -118,45 +122,79 @@ def create_dataset(mode, files, eels_id):
     folder = Path(workspace.name)
     if mode == "EELS":
         npy = folder / "measurements.npy"
-        save_upload(files[0], npy)
+        fingerprint = save_upload(files[0], npy)
         raw = load_eels(npy, eels_id)
         dataset_key = f"eels_{eels_id}"
     else:
         ibw = folder / "image.ibw"
         h5 = folder / "force_map.h5"
-        save_upload(files[0], ibw)
-        save_upload(files[1], h5)
+        image_hash = save_upload(files[0], ibw)
+        force_hash = save_upload(files[1], h5)
+        fingerprint = hashlib.sha256((image_hash + force_hash).encode()).hexdigest()
         raw = load_nonlinearity(ibw, h5)
         dataset_key = "nonlinearity"
     bundle = schedule(raw, n_candidates=N_CANDIDATES, n_steps=N_STEPS,
                       seed=SEED, patch_size=PATCH_SIZE)
-    return workspace, raw, bundle, dataset_key
+    # Separate histories when a different upload is used.
+    dataset_key += "_" + fingerprint[:16]
+    return workspace, raw, bundle, dataset_key, fingerprint
 
 
-def export_trace(pid, key, bundle, raw, decisions):
+def build_trace(pid, key, bundle, raw, decisions, fingerprint):
+    """Analysis-ready human decisions, including every presented patch."""
     outputs = []
     for step, pos, idx, stamp in decisions:
         start = (step - 1) * N_CANDIDATES
+        stop = start + N_CANDIDATES
         slot = start + pos
-        axis, signal = get_response(raw, idx)
+        expected_index = int(bundle["indices"][slot])
+        if int(idx) != expected_index:
+            raise ValueError(f"Stored decision {step} does not match candidate schedule")
+
+        full = get_full_response(raw, idx)
         outputs.append({
             "step": int(step),
-            "candidate_indices": bundle["indices"][start:start+N_CANDIDATES],
-            "candidate_ids": bundle["ids"][start:start+N_CANDIDATES],
-            "candidate_coordinates": bundle["coordinates"][start:start+N_CANDIDATES],
-            "selected_position": int(pos),
-            "selected_index": int(idx),
-            "selected_id": bundle["ids"][slot],
-            "selected_coordinates": bundle["coordinates"][slot],
-            "selected_spectrum_axis": axis.tolist(),
-            "selected_spectrum_signal": signal.tolist(),
             "timestamp_utc": stamp,
+            "candidate_indices": np.asarray(bundle["indices"][start:stop], dtype=np.int64),
+            "candidate_ids": list(bundle["ids"][start:stop]),
+            "candidate_coordinates": np.asarray(bundle["coordinates"][start:stop]).copy(),
+            "candidate_patches": np.asarray(bundle["patches"][start:stop], dtype=np.float32).copy(),
+            "selected_position": int(pos),  # 0-based, as in SV-DKL traces
+            "selected_index": int(idx),
+            "selected_id": str(bundle["ids"][slot]),
+            "selected_coordinates": np.asarray(bundle["coordinates"][slot]).copy(),
+            "selected_patch": np.asarray(bundle["patches"][slot], dtype=np.float32).copy(),
+            "selected_axis": np.asarray(full["axis"]).copy(),
+            "selected_spectrum": np.asarray(full["signal"]).copy(),
+            "selected_raw_measurement": np.asarray(full["raw"]).copy(),
+            "measurement_channels": full["channels"],
         })
-    output = {
-        "participant_id": pid, "dataset": key, "n_candidates": N_CANDIDATES,
-        "seed": SEED, "steps_completed": len(outputs), "decisions": outputs,
+
+    return {
+        "schema_version": "human-sv-dkl-1.0",
+        "participant_id": str(pid),  # pseudonymous only; no identity mapping
+        "dataset": raw["dataset"],
+        "dataset_key": key,
+        "dataset_sha256": fingerprint,
+        "eels_dataset_id": raw.get("dataset_id"),
+        "grid_shape": tuple(map(int, raw["grid_shape"])),
+        "image_shape": tuple(map(int, raw["image"].shape)),
+        "patch_size": PATCH_SIZE,
+        "n_candidates": N_CANDIDATES,
+        "n_steps_planned": bundle["n_steps"],
+        "steps_completed": len(outputs),
+        "candidate_seed": SEED,
+        "candidate_schedule": "same fixed shuffled pool for all participants",
+        "axis_label": raw["axis_label"],
+        "response_label": raw["response_label"],
+        "decision_indexing": "step is 1-based; selected_position and measurement indices are 0-based",
+        "decisions": outputs,
     }
-    return gzip.compress(json.dumps(output).encode("utf-8"))
+
+
+def export_trace_pkl(pid, key, bundle, raw, decisions, fingerprint):
+    return pickle.dumps(build_trace(pid, key, bundle, raw, decisions, fingerprint),
+                        protocol=pickle.HIGHEST_PROTOCOL)
 
 
 st.title("Manual Scientific Measurement Selection")
@@ -200,10 +238,10 @@ if "dataset" not in st.session_state:
     if st.button("Load dataset", type="primary", disabled=not bool(files)):
         try:
             with st.spinner("Reading scientific measurements and preparing candidates..."):
-                workspace, raw, bundle, key = create_dataset(
+                workspace, raw, bundle, key, fingerprint = create_dataset(
                     "EELS" if mode == "EELS" else "AFM", files, eels_id
                 )
-            st.session_state.dataset = {"workspace": workspace, "raw": raw, "bundle": bundle, "key": key}
+            st.session_state.dataset = {"workspace": workspace, "raw": raw, "bundle": bundle, "key": key, "fingerprint": fingerprint}
             st.rerun()
         except Exception as err:
             st.error(f"Unable to read files: {err}")
@@ -211,6 +249,7 @@ if "dataset" not in st.session_state:
 
 loaded = st.session_state.dataset
 raw, bundle, key = loaded["raw"], loaded["bundle"], loaded["key"]
+fingerprint = loaded["fingerprint"]
 if st.sidebar.button("Load different files"):
     st.session_state.pop("dataset", None)
     st.rerun()
@@ -234,10 +273,10 @@ if hist:
 # Can download a trace after every step, not only at the end.
 if hist:
     st.download_button(
-        "Download your coded decision trace (.json.gz)",
-        data=export_trace(pid, key, bundle, raw, hist),
-        file_name=f"trace_{pid}_{key}.json.gz",
-        mime="application/gzip",
+        "Download complete coded decision trace (.pkl)",
+        data=export_trace_pkl(pid, key, bundle, raw, hist, fingerprint),
+        file_name=f"trace_{pid}_{key}.pkl",
+        mime="application/octet-stream",
     )
 
 next_step = len(hist)+1
